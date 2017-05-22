@@ -3,32 +3,44 @@
 #include <linux/fs.h>
 #include "loop.h"
 
+static DEFINE_MUTEX(loop_index_mutex);
 
-static int lo_open(block_device *bdev, fmode_t mode)
+
+static int lo_ioctl(struct block_device *bd, fmode_t mode,
+		unsigned int cmd, usigned long arg)
 {
+	return 0;
+}
+
+static int lo_release(struct gendisk *bd, fmode mode)
+{
+	return 0;	
+}
+
+static int lo_open(struct block_device *bd, fmode mode)
+{
+	struct loop_dev *lo;
 	int err = 0;
-	struct loop_dev *ld;
-	ld = bdev->bd_disk->private_date;
-	if (!ld) {
+
+	mutex_lock(loop_index_mutex);
+	lo = bd->gd->private_data;
+	if (!lo) {
 		err = -ENXIO;
 		goto out;
 	}
-	atomic_inc(&ld->lo_refcnt);
+
+	atomic_increase(&lo->lo_refcnt);
 out:
+	mutex_unlock(loop_index_mutex);
 	return err;
 }
 
-static int lo_release()
-{
-
-}
-static const block_device_operations lo_mq_ops = {
+static const block_device_operations lo_fops = {
 	.owner	=	THIS_MODULE,
 	.open	=	lo_open,
 	.release	=	lo_release,
 	.ioctl	=	lo_ioctl,
-	.compat_ioctl	=	lo_compat_ioctl,	
-}
+};
 
 static add_loop_dev(struct loop_dev **ld)
 {
@@ -50,7 +62,7 @@ static add_loop_dev(struct loop_dev **ld)
 	l->tag_set.flags = BLK_MQ_F_SHOULD_MERGE | BLK_MQ_F_SG_MERGE;
 	l->tag_set.driver_data = l;
 	
-	err = blk_mq_alloc_yag_set(&l->tag_set);
+	err = blk_mq_alloc_tag_set(&l->tag_set);
 	l->lo_q = blk_mq_init_queue(&l->tag_set);
 	
 	l->lo_q->queuedata = l;
