@@ -42,6 +42,221 @@ static const block_device_operations lo_fops = {
 	.ioctl	=	lo_ioctl,
 };
 
+static int lo_queue_rq(struct blk_mq_hw_ctx *hctx,
+		const struct blk_mq_queue_data *bd)
+{
+	struct lo_cmd *cmd = blk_mq_rq_to_pdu(bd->rq);
+	struct loop_device *lo = cmd->rq->queue->queuedata;
+	blk_mq_start_request(bd->rq);
+
+	switch(req_op(cmd->rq)) {
+	case REQ_OP_FLUSH:
+	case REQ_OP_DISCARD:
+	case REQ_OP_WRITE_ZEROS:
+		cmd->use_aio = false;	
+		break;
+	default:
+		cmd->use_aio = lo->use_aio;
+		break;
+	}
+
+	kthread_queue_work(&lo->worker, &cmd->work);
+	return BLK_MQ_RQ_QUEUE_OK;
+}
+
+static int lo_read_simple(struct loop_device *lo, struct request *rq,
+                loff_t pos)
+{
+        struct bio_vec bvec;      
+        struct req_iterator iter;
+        struct iov_iter i;
+        ssize_t len;
+                
+        rq_for_each_segment(bvec, rq, iter) {
+                iov_iter_bvec(&i, ITER_BVEC, &bvec, 1, bvec.bv_len);
+                len = vfs_iter_read(lo->lo_backing_file, &i, &pos);
+                if (len < 0)
+                        return len;
+        
+                flush_dcache_page(bvec.bv_page);
+                                                                                                                                                               
+                if (len != bvec.bv_len) {
+                        struct bio *bio;
+ 
+                        __rq_for_each_bio(bio, rq)
+                                zero_fill_bio(bio);
+                        break;
+                }
+                cond_resched();
+        }
+ 
+        return 0;
+}
+
+static int lo_read_transfer(struct loop_device *lo, struct request *rq,
+                loff_t pos)
+{               
+        struct bio_vec bvec, b;
+        struct req_iterator iter;
+        struct iov_iter i;
+        struct page *page;
+        ssize_t len;
+        int ret = 0;
+                
+        page = alloc_page(GFP_NOIO);
+        if (unlikely(!page))
+                return -ENOMEM;
+                
+        rq_for_each_segment(bvec, rq, iter) {
+                loff_t offset = pos;
+                
+                b.bv_page = page;
+                b.bv_offset = 0;
+                b.bv_len = bvec.bv_len;
+                
+                iov_iter_bvec(&i, ITER_BVEC, &b, 1, b.bv_len);
+                len = vfs_iter_read(lo->lo_backing_file, &i, &pos);                                                                                            
+                if (len < 0) {
+                        ret = len;
+                        goto out_free_page;
+                }
+
+                ret = lo_do_transfer(lo, READ, page, 0, bvec.bv_page,
+                        bvec.bv_offset, len, offset >> 9);
+                if (ret)
+                        goto out_free_page;
+         
+                flush_dcache_page(bvec.bv_page);
+         
+                if (len != bvec.bv_len) {
+                        struct bio *bio;
+         
+                        __rq_for_each_bio(bio, rq)
+                                zero_fill_bio(bio);
+                        break;
+                }
+        }
+         
+        ret = 0;
+out_free_page:
+        __free_page(page);
+        return ret;
+}
+
+static int lo_write_simple(struct loop_device *lo, struct request *rq,
+                loff_t pos)
+{      
+        struct bio_vec bvec;
+        struct req_iterator iter;
+        int ret = 0;
+       
+        rq_for_each_segment(bvec, rq, iter) {
+                ret = lo_write_bvec(lo->lo_backing_file, &bvec, &pos);
+                if (ret < 0)
+                        break;
+                cond_resched();
+        }
+       
+        return ret;
+} 
+
+static int lo_write_transfer(struct loop_device *lo, struct request *rq,
+                loff_t pos)
+{      
+        struct bio_vec bvec, b;
+        struct req_iterator iter;
+        struct page *page;
+        int ret = 0;
+       
+        page = alloc_page(GFP_NOIO);
+        if (unlikely(!page))
+                return -ENOMEM;
+       
+        rq_for_each_segment(bvec, rq, iter) {
+                ret = lo_do_transfer(lo, WRITE, page, 0, bvec.bv_page,
+                        bvec.bv_offset, bvec.bv_len, pos >> 9);
+                if (unlikely(ret))
+                        break;
+       
+                b.bv_page = page;
+                b.bv_offset = 0;
+                b.bv_len = bvec.bv_len;
+                ret = lo_write_bvec(lo->lo_backing_file, &b, &pos);
+                if (ret < 0)
+                        break;
+        }
+                                                                                                                                                               
+        __free_page(page);
+        return ret;
+} 
+
+static int do_req_filebacked(struct loop_device *lo, struct request *rq)
+{
+        struct loop_cmd *cmd = blk_mq_rq_to_pdu(rq);
+        loff_t pos = ((loff_t) blk_rq_pos(rq) << 9) + lo->lo_offset;
+
+        switch (req_op(rq)) {
+        case REQ_OP_FLUSH:
+                return lo_req_flush(lo, rq);
+        case REQ_OP_DISCARD:
+        case REQ_OP_WRITE_ZEROES:
+                return lo_discard(lo, rq, pos);
+        case REQ_OP_WRITE:
+                if (lo->transfer)
+                        return lo_write_transfer(lo, rq, pos);
+                else if (cmd->use_aio)
+                        return lo_rw_aio(lo, cmd, pos, WRITE);
+                else
+                        return lo_write_simple(lo, rq, pos);
+        case REQ_OP_READ:
+                if (lo->transfer)
+                        return lo_read_transfer(lo, rq, pos);
+                else if (cmd->use_aio)
+                        return lo_rw_aio(lo, cmd, pos, READ);
+                else
+                        return lo_read_simple(lo, rq, pos);
+        default:
+                WARN_ON_ONCE(1);
+                return -EIO;
+                break;
+        } 
+}
+
+static void loop_handle_cmd(struct loop_cmd *cmd)
+{
+	const bool write = op_is_write(req_op(cmd->rq));
+	struct loop_dev *lo = cmd->rq->q->queuedata;
+	int ret = 0;
+
+	ret = do_req_filebacked(lo, cmd->rq);
+
+	if (!cmd->use_aio || ret) {
+		cmd->ret = ret ? -EIO : 0;
+		blk_mq_complete_request(cmd->rq);
+	}
+}
+
+static void loop_queue_work(struct kthread_work *work)
+{
+	struct loop_cmd *cmd =
+		container_of(work, struct loop_cmd, work);
+	loop_handle_cmd(cmd);
+}
+
+static int lo_init_request(struct blk_mq_tag_set *set, struct request *rq,
+		unsigned int hctx_idx, unsigned int numa_node)
+{
+	struct loop_cmd *cmd = blk_mq_rq_to_pdu(rq);
+
+	cmd->rq = rq;
+	kthread_init_work(&cmd->work, loop_queue_work);
+	return 0;
+}
+
+
+
+
+
 static struct blk_mq_ops lo_mq_ops = {
 	.queue_rq	=	lo_queue_rq,
 	.init_request	=	lo_init_request,
