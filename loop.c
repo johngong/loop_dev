@@ -14,7 +14,7 @@ static int lo_ioctl(struct block_device *bd, fmode_t mode,
 
 static int lo_release(struct gendisk *bd, fmode mode)
 {
-	return 0;	
+	return 0;
 }
 
 static int lo_open(struct block_device *bd, fmode mode)
@@ -42,18 +42,24 @@ static const block_device_operations lo_fops = {
 	.ioctl	=	lo_ioctl,
 };
 
+static struct blk_mq_ops lo_mq_ops = {
+	.queue_rq	=	lo_queue_rq,
+	.init_request	=	lo_init_request,
+	.complete	=       lo_complete_request,
+}
+
 static add_loop_dev(struct loop_dev **ld)
 {
 	int err, i;
 	struct loop_dev	*l;
-	struct gendisk	*gd;	
+	struct gendisk	*gd;
 
 	l = kzalloc(sizeof(*l), GFP_KERNEL);
 	l->lo_state = 0;
 	err = idr_alloc(&loop_idr, l, 0, 0, GFP_KERNEL);
-	
+
 	i = err;
-	
+
 	l->tag_set.ops = &lo_mq_ops;
 	l->tag_set.nr_hw_queues = 1;
 	l->tag_set.queue_depth = 128;
@@ -61,12 +67,12 @@ static add_loop_dev(struct loop_dev **ld)
 	l->tag_set.cmd_size = sizeof(struct loop_cmd);
 	l->tag_set.flags = BLK_MQ_F_SHOULD_MERGE | BLK_MQ_F_SG_MERGE;
 	l->tag_set.driver_data = l;
-	
+
 	err = blk_mq_alloc_tag_set(&l->tag_set);
 	l->lo_q = blk_mq_init_queue(&l->tag_set);
-	
+
 	l->lo_q->queuedata = l;
-	
+
 	__set_bit(QUEUE_FLAG_NOMERGES, &l->lo_q->queue_flags);
 
 	gd = l->lo_disk = alloc_disk(0);
@@ -75,7 +81,7 @@ static add_loop_dev(struct loop_dev **ld)
 	gd->fops = &lo_fops;
 	gd->private_date = l;
 	gd->queue = l->lo_q;
-	
+
 	add_disk(gd);
 
 	*ld = l;
@@ -91,7 +97,7 @@ static int __init loop_init(void)
 	major = register_blkdev(0, "jgloop")
 	if (major < 0)
 		return -ENOMEM;
-	
+
 	kobj_map(bdev_map, MKDEV(major, 0), (1UL << 20), THIS_MODULE, loop_probe, NULL, NULL);
 	add_loop_dev(&ld);
 	return 0;
