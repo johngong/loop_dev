@@ -253,9 +253,20 @@ static int lo_init_request(struct blk_mq_tag_set *set, struct request *rq,
 	return 0;
 }
 
+static void lo_complete_request(struct request *rq)
+{
+        struct loop_cmd *cmd = blk_mq_rq_to_pdu(rq);
 
+        if (unlikely(req_op(cmd->rq) == REQ_OP_READ && cmd->use_aio &&
+                     cmd->ret >= 0 && cmd->ret < blk_rq_bytes(cmd->rq))) {
+                struct bio *bio = cmd->rq->bio;
 
+                bio_advance(bio, cmd->ret);
+                zero_fill_bio(bio);
+        }
 
+        blk_mq_end_request(rq, cmd->ret < 0 ? -EIO : 0);
+}
 
 static struct blk_mq_ops lo_mq_ops = {
 	.queue_rq	=	lo_queue_rq,
