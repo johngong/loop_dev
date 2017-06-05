@@ -1,41 +1,40 @@
 #include <linux/module.h>
 #include <linux/sched.h>
 #include <linux/fs.h>
-#include "loop.h"
+#include "lo_jg.h"
 
 static DEFINE_MUTEX(loop_index_mutex);
 
-
 static int lo_ioctl(struct block_device *bd, fmode_t mode,
-		unsigned int cmd, usigned long arg)
+		unsigned int cmd, unsigned long arg)
 {
 	return 0;
 }
 
-static int lo_release(struct gendisk *bd, fmode mode)
+static int lo_release(struct gendisk *bd, fmode_t mode)
 {
 	return 0;
 }
 
-static int lo_open(struct block_device *bd, fmode mode)
+static int lo_open(struct block_device *bd, fmode_t mode)
 {
 	struct loop_dev *lo;
 	int err = 0;
 
-	mutex_lock(loop_index_mutex);
-	lo = bd->gd->private_data;
+	mutex_lock(&loop_index_mutex);
+	lo = bd->bd_disk->private_data;
 	if (!lo) {
 		err = -ENXIO;
 		goto out;
 	}
 
-	atomic_increase(&lo->lo_refcnt);
+	atomic_inc(&lo->lo_refcnt);
 out:
-	mutex_unlock(loop_index_mutex);
+	mutex_unlock(&loop_index_mutex);
 	return err;
 }
 
-static const block_device_operations lo_fops = {
+static const struct block_device_operations lo_fops = {
 	.owner	=	THIS_MODULE,
 	.open	=	lo_open,
 	.release	=	lo_release,
@@ -53,7 +52,7 @@ static int lo_queue_rq(struct blk_mq_hw_ctx *hctx,
 	case REQ_OP_FLUSH:
 	case REQ_OP_DISCARD:
 	case REQ_OP_WRITE_ZEROS:
-		cmd->use_aio = false;	
+		cmd->use_aio = false;
 		break;
 	default:
 		cmd->use_aio = lo->use_aio;
@@ -67,56 +66,56 @@ static int lo_queue_rq(struct blk_mq_hw_ctx *hctx,
 static int lo_read_simple(struct loop_device *lo, struct request *rq,
                 loff_t pos)
 {
-        struct bio_vec bvec;      
+        struct bio_vec bvec;
         struct req_iterator iter;
         struct iov_iter i;
         ssize_t len;
-                
+
         rq_for_each_segment(bvec, rq, iter) {
                 iov_iter_bvec(&i, ITER_BVEC, &bvec, 1, bvec.bv_len);
                 len = vfs_iter_read(lo->lo_backing_file, &i, &pos);
                 if (len < 0)
                         return len;
-        
+
                 flush_dcache_page(bvec.bv_page);
-                                                                                                                                                               
+
                 if (len != bvec.bv_len) {
                         struct bio *bio;
- 
+
                         __rq_for_each_bio(bio, rq)
                                 zero_fill_bio(bio);
                         break;
                 }
                 cond_resched();
         }
- 
+
         return 0;
 }
 
 static int lo_read_transfer(struct loop_device *lo, struct request *rq,
                 loff_t pos)
-{               
+{
         struct bio_vec bvec, b;
         struct req_iterator iter;
         struct iov_iter i;
         struct page *page;
         ssize_t len;
         int ret = 0;
-                
+
         page = alloc_page(GFP_NOIO);
         if (unlikely(!page))
                 return -ENOMEM;
-                
+
         rq_for_each_segment(bvec, rq, iter) {
                 loff_t offset = pos;
-                
+
                 b.bv_page = page;
                 b.bv_offset = 0;
                 b.bv_len = bvec.bv_len;
-                
+
                 iov_iter_bvec(&i, ITER_BVEC, &b, 1, b.bv_len);
-                len = vfs_iter_read(lo->lo_backing_file, &i, &pos);                                                                                            
-                if (len < 0) {
+                len = vfs_iter_read(lo->lo_backing_file, &i, &pos);
+		if (len < 0) {
                         ret = len;
                         goto out_free_page;
                 }
@@ -125,18 +124,18 @@ static int lo_read_transfer(struct loop_device *lo, struct request *rq,
                         bvec.bv_offset, len, offset >> 9);
                 if (ret)
                         goto out_free_page;
-         
+
                 flush_dcache_page(bvec.bv_page);
-         
+
                 if (len != bvec.bv_len) {
                         struct bio *bio;
-         
+
                         __rq_for_each_bio(bio, rq)
                                 zero_fill_bio(bio);
                         break;
                 }
         }
-         
+
         ret = 0;
 out_free_page:
         __free_page(page);
@@ -145,39 +144,39 @@ out_free_page:
 
 static int lo_write_simple(struct loop_device *lo, struct request *rq,
                 loff_t pos)
-{      
+{
         struct bio_vec bvec;
         struct req_iterator iter;
         int ret = 0;
-       
+
         rq_for_each_segment(bvec, rq, iter) {
                 ret = lo_write_bvec(lo->lo_backing_file, &bvec, &pos);
                 if (ret < 0)
                         break;
                 cond_resched();
         }
-       
+
         return ret;
-} 
+}
 
 static int lo_write_transfer(struct loop_device *lo, struct request *rq,
                 loff_t pos)
-{      
+{
         struct bio_vec bvec, b;
         struct req_iterator iter;
         struct page *page;
         int ret = 0;
-       
+
         page = alloc_page(GFP_NOIO);
         if (unlikely(!page))
                 return -ENOMEM;
-       
+
         rq_for_each_segment(bvec, rq, iter) {
                 ret = lo_do_transfer(lo, WRITE, page, 0, bvec.bv_page,
                         bvec.bv_offset, bvec.bv_len, pos >> 9);
                 if (unlikely(ret))
                         break;
-       
+
                 b.bv_page = page;
                 b.bv_offset = 0;
                 b.bv_len = bvec.bv_len;
@@ -185,10 +184,10 @@ static int lo_write_transfer(struct loop_device *lo, struct request *rq,
                 if (ret < 0)
                         break;
         }
-                                                                                                                                                               
+
         __free_page(page);
         return ret;
-} 
+}
 
 static int do_req_filebacked(struct loop_device *lo, struct request *rq)
 {
@@ -219,7 +218,7 @@ static int do_req_filebacked(struct loop_device *lo, struct request *rq)
                 WARN_ON_ONCE(1);
                 return -EIO;
                 break;
-        } 
+        }
 }
 
 static void loop_handle_cmd(struct loop_cmd *cmd)

@@ -1,10 +1,14 @@
 #include <linux/module.h>
+#include <linux/kthread.h>
+#include <linux/blk-mq.h>
+#include <linux/blkdev.h>
 
 struct loop_cmd {
+	struct kthread_work	work;
 	struct list_head	list;
 	struct request	*rq;
-	struct kthread_work	work;
-	struct kiocb	iocb;	
+	bool use_aio;
+	struct kiocb	iocb;
 };
 
 struct loop_dev {
