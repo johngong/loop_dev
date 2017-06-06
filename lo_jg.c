@@ -3,6 +3,7 @@
 #include <linux/fs.h>
 #include <linux/uio.h>
 #include <linux/falloc.h>
+#include <linux/kobj_map.h>
 #include "lo_jg.h"
 
 static DEFINE_MUTEX(loop_index_mutex);
@@ -251,14 +252,16 @@ static int __init loop_init(void)
 	if (major < 0)
 		return -ENOMEM;
 
-	kobject_map(bdev_map, MKDEV(major, 0), (1UL << 20), THIS_MODULE, loop_probe, NULL, NULL);
+	blk_register_region(MKDEV(major, 0), (1UL << 20),
+                                  THIS_MODULE, loop_probe, NULL, NULL);
+
 	add_loop_dev(&ld);
 	return 0;
 }
 
 static void __exit loop_exit(void)
 {
-	kobject_unmap(bdev_map, MKDEV(major, 0), (1UL << 20));
+	blk_unregister_region(MKDEV(major, 0), (1UL << 20));
 }
 
 module_init(loop_init);
