@@ -1,6 +1,8 @@
 #include <linux/module.h>
 #include <linux/sched.h>
 #include <linux/fs.h>
+#include <linux/uio.h>
+#include <linux/falloc.h>
 #include "lo_jg.h"
 
 static DEFINE_MUTEX(loop_index_mutex);
@@ -18,7 +20,7 @@ static int lo_release(struct gendisk *bd, fmode_t mode)
 
 static int lo_open(struct block_device *bd, fmode_t mode)
 {
-	struct loop_dev *lo;
+	struct lo_dev *lo;
 	int err = 0;
 
 	mutex_lock(&loop_index_mutex);
@@ -45,25 +47,14 @@ static int lo_queue_rq(struct blk_mq_hw_ctx *hctx,
 		const struct blk_mq_queue_data *bd)
 {
 	struct lo_cmd *cmd = blk_mq_rq_to_pdu(bd->rq);
-	struct loop_device *lo = cmd->rq->queue->queuedata;
+	struct lo_dev *lo = cmd->rq->q->queuedata;
 	blk_mq_start_request(bd->rq);
-
-	switch(req_op(cmd->rq)) {
-	case REQ_OP_FLUSH:
-	case REQ_OP_DISCARD:
-	case REQ_OP_WRITE_ZEROS:
-		cmd->use_aio = false;
-		break;
-	default:
-		cmd->use_aio = lo->use_aio;
-		break;
-	}
 
 	kthread_queue_work(&lo->worker, &cmd->work);
 	return BLK_MQ_RQ_QUEUE_OK;
 }
 
-static int lo_read_simple(struct loop_device *lo, struct request *rq,
+static int lo_read_simple(struct lo_dev *lo, struct request *rq,
                 loff_t pos)
 {
         struct bio_vec bvec;
@@ -92,57 +83,29 @@ static int lo_read_simple(struct loop_device *lo, struct request *rq,
         return 0;
 }
 
-static int lo_read_transfer(struct loop_device *lo, struct request *rq,
-                loff_t pos)
+static int lo_write_bvec(struct file *file, struct bio_vec *bvec, loff_t *ppos)
 {
-        struct bio_vec bvec, b;
-        struct req_iterator iter;
         struct iov_iter i;
-        struct page *page;
-        ssize_t len;
-        int ret = 0;
+        ssize_t bw;
 
-        page = alloc_page(GFP_NOIO);
-        if (unlikely(!page))
-                return -ENOMEM;
+        iov_iter_bvec(&i, ITER_BVEC, bvec, 1, bvec->bv_len);
 
-        rq_for_each_segment(bvec, rq, iter) {
-                loff_t offset = pos;
+        file_start_write(file);
+        bw = vfs_iter_write(file, &i, ppos);
+        file_end_write(file);
 
-                b.bv_page = page;
-                b.bv_offset = 0;
-                b.bv_len = bvec.bv_len;
+        if (likely(bw ==  bvec->bv_len))
+                return 0;
 
-                iov_iter_bvec(&i, ITER_BVEC, &b, 1, b.bv_len);
-                len = vfs_iter_read(lo->lo_backing_file, &i, &pos);
-		if (len < 0) {
-                        ret = len;
-                        goto out_free_page;
-                }
-
-                ret = lo_do_transfer(lo, READ, page, 0, bvec.bv_page,
-                        bvec.bv_offset, len, offset >> 9);
-                if (ret)
-                        goto out_free_page;
-
-                flush_dcache_page(bvec.bv_page);
-
-                if (len != bvec.bv_len) {
-                        struct bio *bio;
-
-                        __rq_for_each_bio(bio, rq)
-                                zero_fill_bio(bio);
-                        break;
-                }
-        }
-
-        ret = 0;
-out_free_page:
-        __free_page(page);
-        return ret;
+        printk_ratelimited(KERN_ERR
+                "loop: Write error at byte offset %llu, length %i.\n",
+                (unsigned long long)*ppos, bvec->bv_len);
+        if (bw >= 0)
+                bw = -EIO;
+        return bw;
 }
 
-static int lo_write_simple(struct loop_device *lo, struct request *rq,
+static int lo_write_simple(struct lo_dev *lo, struct request *rq,
                 loff_t pos)
 {
         struct bio_vec bvec;
@@ -159,61 +122,49 @@ static int lo_write_simple(struct loop_device *lo, struct request *rq,
         return ret;
 }
 
-static int lo_write_transfer(struct loop_device *lo, struct request *rq,
-                loff_t pos)
+static int lo_discard(struct lo_dev *lo, struct request *rq, loff_t pos)
 {
-        struct bio_vec bvec, b;
-        struct req_iterator iter;
-        struct page *page;
-        int ret = 0;
+        /*
+         * We use punch hole to reclaim the free space used by the
+         * image a.k.a. discard. However we do not support discard if
+         * encryption is enabled, because it may give an attacker
+         * useful information.
+         */
+        struct file *file = lo->lo_backing_file;
+        int mode = FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE;
+        int ret;
 
-        page = alloc_page(GFP_NOIO);
-        if (unlikely(!page))
-                return -ENOMEM;
-
-        rq_for_each_segment(bvec, rq, iter) {
-                ret = lo_do_transfer(lo, WRITE, page, 0, bvec.bv_page,
-                        bvec.bv_offset, bvec.bv_len, pos >> 9);
-                if (unlikely(ret))
-                        break;
-
-                b.bv_page = page;
-                b.bv_offset = 0;
-                b.bv_len = bvec.bv_len;
-                ret = lo_write_bvec(lo->lo_backing_file, &b, &pos);
-                if (ret < 0)
-                        break;
-        }
-
-        __free_page(page);
+        ret = file->f_op->fallocate(file, mode, pos, blk_rq_bytes(rq));
+        if (unlikely(ret && ret != -EINVAL && ret != -EOPNOTSUPP))
+                ret = -EIO;
+ out:
         return ret;
 }
 
-static int do_req_filebacked(struct loop_device *lo, struct request *rq)
+static int lo_req_flush(struct lo_dev *lo, struct request *rq)
 {
-        struct loop_cmd *cmd = blk_mq_rq_to_pdu(rq);
+        struct file *file = lo->lo_backing_file;
+        int ret = vfs_fsync(file, 0);
+        if (unlikely(ret && ret != -EINVAL))
+                ret = -EIO;
+
+        return ret;
+}
+
+static int do_req_filebacked(struct lo_dev *lo, struct request *rq)
+{
+        struct lo_cmd *cmd = blk_mq_rq_to_pdu(rq);
         loff_t pos = ((loff_t) blk_rq_pos(rq) << 9) + lo->lo_offset;
 
         switch (req_op(rq)) {
         case REQ_OP_FLUSH:
                 return lo_req_flush(lo, rq);
         case REQ_OP_DISCARD:
-        case REQ_OP_WRITE_ZEROES:
                 return lo_discard(lo, rq, pos);
         case REQ_OP_WRITE:
-                if (lo->transfer)
-                        return lo_write_transfer(lo, rq, pos);
-                else if (cmd->use_aio)
-                        return lo_rw_aio(lo, cmd, pos, WRITE);
-                else
-                        return lo_write_simple(lo, rq, pos);
+                return lo_write_simple(lo, rq, pos);
         case REQ_OP_READ:
-                if (lo->transfer)
-                        return lo_read_transfer(lo, rq, pos);
-                else if (cmd->use_aio)
-                        return lo_rw_aio(lo, cmd, pos, READ);
-                else
-                        return lo_read_simple(lo, rq, pos);
+                return lo_read_simple(lo, rq, pos);
         default:
                 WARN_ON_ONCE(1);
                 return -EIO;
@@ -221,75 +172,54 @@ static int do_req_filebacked(struct loop_device *lo, struct request *rq)
         }
 }
 
-static void loop_handle_cmd(struct loop_cmd *cmd)
+static void loop_handle_cmd(struct lo_cmd *cmd)
 {
-	const bool write = op_is_write(req_op(cmd->rq));
-	struct loop_dev *lo = cmd->rq->q->queuedata;
+	struct lo_dev *lo = cmd->rq->q->queuedata;
 	int ret = 0;
 
 	ret = do_req_filebacked(lo, cmd->rq);
 
-	if (!cmd->use_aio || ret) {
-		cmd->ret = ret ? -EIO : 0;
-		blk_mq_complete_request(cmd->rq);
-	}
+	if (ret)
+		blk_mq_complete_request(cmd->rq, ret ? -EIO : 0);
 }
 
 static void loop_queue_work(struct kthread_work *work)
 {
-	struct loop_cmd *cmd =
-		container_of(work, struct loop_cmd, work);
+	struct lo_cmd *cmd =
+		container_of(work, struct lo_cmd, work);
 	loop_handle_cmd(cmd);
 }
 
 static int lo_init_request(struct blk_mq_tag_set *set, struct request *rq,
 		unsigned int hctx_idx, unsigned int numa_node)
 {
-	struct loop_cmd *cmd = blk_mq_rq_to_pdu(rq);
+	struct lo_cmd *cmd = blk_mq_rq_to_pdu(rq);
 
 	cmd->rq = rq;
 	kthread_init_work(&cmd->work, loop_queue_work);
 	return 0;
 }
 
-static void lo_complete_request(struct request *rq)
-{
-        struct loop_cmd *cmd = blk_mq_rq_to_pdu(rq);
-
-        if (unlikely(req_op(cmd->rq) == REQ_OP_READ && cmd->use_aio &&
-                     cmd->ret >= 0 && cmd->ret < blk_rq_bytes(cmd->rq))) {
-                struct bio *bio = cmd->rq->bio;
-
-                bio_advance(bio, cmd->ret);
-                zero_fill_bio(bio);
-        }
-
-        blk_mq_end_request(rq, cmd->ret < 0 ? -EIO : 0);
-}
-
 static struct blk_mq_ops lo_mq_ops = {
 	.queue_rq	=	lo_queue_rq,
 	.init_request	=	lo_init_request,
-	.complete	=       lo_complete_request,
-}
+};
 
-static add_loop_dev(struct loop_dev **ld)
+static int major;
+
+static add_loop_dev(struct lo_dev **ld)
 {
 	int err, i;
-	struct loop_dev	*l;
+	struct lo_dev	*l;
 	struct gendisk	*gd;
 
 	l = kzalloc(sizeof(*l), GFP_KERNEL);
-	l->lo_state = 0;
-	err = idr_alloc(&loop_idr, l, 0, 0, GFP_KERNEL);
-
-	i = err;
 
 	l->tag_set.ops = &lo_mq_ops;
 	l->tag_set.nr_hw_queues = 1;
 	l->tag_set.queue_depth = 128;
 	l->tag_set.numa_node = NUMA_NO_NODE;
-	l->tag_set.cmd_size = sizeof(struct loop_cmd);
+	l->tag_set.cmd_size = sizeof(struct lo_cmd);
 	l->tag_set.flags = BLK_MQ_F_SHOULD_MERGE | BLK_MQ_F_SG_MERGE;
 	l->tag_set.driver_data = l;
 
@@ -300,11 +230,11 @@ static add_loop_dev(struct loop_dev **ld)
 
 	__set_bit(QUEUE_FLAG_NOMERGES, &l->lo_q->queue_flags);
 
-	gd = l->lo_disk = alloc_disk(0);
+	gd = l->gd = alloc_disk(0);
 	gd->major = major;
 	gd->first_minor = 0;
 	gd->fops = &lo_fops;
-	gd->private_date = l;
+	gd->private_data = l;
 	gd->queue = l->lo_q;
 
 	add_disk(gd);
@@ -313,17 +243,15 @@ static add_loop_dev(struct loop_dev **ld)
 	return 0;
 }
 
-
-static int major;
 static int __init loop_init(void)
 {
-	struct loop_dev *ld;
+	struct lo_dev *ld;
 
-	major = register_blkdev(0, "jgloop")
+	major = register_blkdev(0, "jgloop");
 	if (major < 0)
 		return -ENOMEM;
 
-	kobj_map(bdev_map, MKDEV(major, 0), (1UL << 20), THIS_MODULE, loop_probe, NULL, NULL);
+	kobject_map(bdev_map, MKDEV(major, 0), (1UL << 20), THIS_MODULE, loop_probe, NULL, NULL);
 	add_loop_dev(&ld);
 	return 0;
 }
