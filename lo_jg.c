@@ -4,6 +4,7 @@
 #include <linux/uio.h>
 #include <linux/falloc.h>
 #include <linux/kobj_map.h>
+#include <linux/kthread.h>
 #include "lo_jg.h"
 
 static DEFINE_MUTEX(loop_index_mutex);
@@ -14,9 +15,8 @@ static int lo_ioctl(struct block_device *bd, fmode_t mode,
 	return 0;
 }
 
-static int lo_release(struct gendisk *bd, fmode_t mode)
+static void lo_release(struct gendisk *bd, fmode_t mode)
 {
-	return 0;
 }
 
 static int lo_open(struct block_device *bd, fmode_t mode)
@@ -138,7 +138,7 @@ static int lo_discard(struct lo_dev *lo, struct request *rq, loff_t pos)
         ret = file->f_op->fallocate(file, mode, pos, blk_rq_bytes(rq));
         if (unlikely(ret && ret != -EINVAL && ret != -EOPNOTSUPP))
                 ret = -EIO;
- out:
+
         return ret;
 }
 
@@ -154,7 +154,6 @@ static int lo_req_flush(struct lo_dev *lo, struct request *rq)
 
 static int do_req_filebacked(struct lo_dev *lo, struct request *rq)
 {
-        struct lo_cmd *cmd = blk_mq_rq_to_pdu(rq);
         loff_t pos = ((loff_t) blk_rq_pos(rq) << 9) + lo->lo_offset;
 
         switch (req_op(rq)) {
@@ -191,8 +190,9 @@ static void loop_queue_work(struct kthread_work *work)
 	loop_handle_cmd(cmd);
 }
 
-static int lo_init_request(struct blk_mq_tag_set *set, struct request *rq,
-		unsigned int hctx_idx, unsigned int numa_node)
+static int lo_init_request(void *data, struct request *rq,
+		unsigned int hctx_idx, unsigned int request_idx, 
+		unsigned int numa_node)
 {
 	struct lo_cmd *cmd = blk_mq_rq_to_pdu(rq);
 
@@ -252,8 +252,10 @@ static int __init loop_init(void)
 	if (major < 0)
 		return -ENOMEM;
 
+	/* 
 	blk_register_region(MKDEV(major, 0), (1UL << 20),
                                   THIS_MODULE, loop_probe, NULL, NULL);
+	*/
 
 	add_loop_dev(&ld);
 	return 0;
