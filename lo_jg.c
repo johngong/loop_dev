@@ -208,9 +208,9 @@ static struct blk_mq_ops lo_mq_ops = {
 
 static int major;
 
-static add_loop_dev(struct lo_dev **ld)
+static int add_loop_dev(struct lo_dev **ld)
 {
-	int err, i;
+	int err;
 	struct lo_dev	*l;
 	struct gendisk	*gd;
 
@@ -268,3 +268,4 @@ static void __exit loop_exit(void)
 
 module_init(loop_init);
 module_exit(loop_exit);
+MODULE_LICENSE("GPL");
