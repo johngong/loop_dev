@@ -238,6 +238,7 @@ static int add_loop_dev(struct lo_dev **ld)
 	gd->fops = &lo_fops;
 	gd->private_data = l;
 	gd->queue = l->lo_q;
+	sprintf(gd->disk_name, "loop0");
 
 	add_disk(gd);
 
@@ -280,20 +281,31 @@ static int __init loop_init(void)
 {
 	struct lo_dev *ld;
 
-	major = register_blkdev(0, "jgloop");
-	if (major < 0)
-		return -ENOMEM;
+	register_blkdev(LOOP_MAJOR, "jgloop");
 
-	blk_register_region(MKDEV(major, 0), (1UL << 20),
+	blk_register_region(MKDEV(LOOP_MAJOR, 0), (1UL),
                                   THIS_MODULE, loop_probe, NULL, NULL);
 
 	add_loop_dev(&ld);
 	return 0;
 }
 
+static void del_loop_dev(struct lo_dev *lo)
+{
+	if (lo) {
+		blk_cleanup_queue(lo->lo_q);
+		del_gendisk(lo->gd);
+		blk_mq_free_tag_set(&lo->tag_set);
+		put_disk(lo->gd);
+		lo = NULL;
+	}
+}
+
 static void __exit loop_exit(void)
 {
-	blk_unregister_region(MKDEV(major, 0), (1UL << 20));
+	del_loop_dev(g_lo);
+	blk_unregister_region(MKDEV(LOOP_MAJOR, 0), 1UL);
+	unregister_blkdev(LOOP_MAJOR, "jgloop");
 }
 
 module_init(loop_init);
