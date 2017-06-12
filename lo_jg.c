@@ -8,6 +8,7 @@
 #include "lo_jg.h"
 
 static DEFINE_MUTEX(loop_index_mutex);
+static struct lo_dev *g_lo = NULL;
 
 static int lo_ioctl(struct block_device *bd, fmode_t mode,
 		unsigned int cmd, unsigned long arg)
@@ -244,6 +245,37 @@ static int add_loop_dev(struct lo_dev **ld)
 	return 0;
 }
 
+static int loop_lookup(struct lo_dev **l)
+{
+	if (g_lo) {
+		*l = g_lo;
+		return 0;
+	} else {
+		*l = NULL;
+		return -ENOMEM;
+	}
+}
+
+static struct kobject *loop_probe(dev_t dev, int *part, void *data)
+{
+        struct lo_dev *lo;
+        struct kobject *kobj;
+        int err;
+
+        mutex_lock(&loop_index_mutex);
+        err = loop_lookup(&lo);
+        if (err < 0)
+                err = add_loop_dev(&lo);
+        if (err < 0)
+                kobj = NULL;
+        else
+                kobj = get_disk(lo->gd);
+        mutex_unlock(&loop_index_mutex);
+
+        *part = 0;
+        return kobj;
+}
+
 static int __init loop_init(void)
 {
 	struct lo_dev *ld;
@@ -252,10 +284,8 @@ static int __init loop_init(void)
 	if (major < 0)
 		return -ENOMEM;
 
-	/* 
 	blk_register_region(MKDEV(major, 0), (1UL << 20),
                                   THIS_MODULE, loop_probe, NULL, NULL);
-	*/
 
 	add_loop_dev(&ld);
 	return 0;
