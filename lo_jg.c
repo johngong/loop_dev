@@ -10,14 +10,40 @@
 static DEFINE_MUTEX(loop_index_mutex);
 static struct lo_dev *g_lo = NULL;
 
+
+static int loop_set_fd(struct lo_dev *lo, struct block_device *bd,
+		fmode_t mode, unsigned long arg)
+{
+	
+
+}
+
+
 static int lo_ioctl(struct block_device *bd, fmode_t mode,
 		unsigned int cmd, unsigned long arg)
 {
+	struct lo_dev *lo = bd->bd_disk->private_data;
+	int err;
+
+	switch (cmd) {
+	case LOOP_SET_FD:
+		err = loop_set_fd(lo, bd, mode, arg);
+		break;
+	case LOOP_SET_CAPACITY:
+		err = -EPERM;
+		break;
+	default:
+		break;
+	}
+
 	return 0;
 }
 
-static void lo_release(struct gendisk *bd, fmode_t mode)
+static void lo_release(struct gendisk *gd, fmode_t mode)
 {
+	struct lo_dev *lo = gd->private_data;
+	if (atomic_dec_return(lo->lo_refcnt))
+		return;
 }
 
 static int lo_open(struct block_device *bd, fmode_t mode)
